@@ -11,55 +11,69 @@ from langchain.text_splitter import MarkdownHeaderTextSplitter, RecursiveCharact
 from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
 from langchain.retrievers import BM25Retriever, EnsembleRetriever
+from langchain.schema.runnable import RunnableMap
 from operator import itemgetter 
 from data_prep import load_pdfs, export_markdown_files, split_documents_by_structure, count_characters
 
 load_dotenv()
 
-'''USE THIS IF YOU DECIDE ON USING CLAUDE'''
+# Choose model
 #CLAUDE_KEY = os.getenv("CLAUDE_KEY")
 #MODEL = "claude-3-7-sonnet-20250219"
-
-'''USE THIS IF YOU DECIDE ON USING OLLAMA'''
 MODEL = "llama3.2"
 
-if MODEL.startswith("claude"):
-    llm = ChatAnthropic(model=MODEL, api_key=CLAUDE_KEY)
-else:
-    llm = OllamaLLM(model=MODEL)
-    embeddings = OllamaEmbeddings(model=MODEL)
-    
-    
-#llm.invoke("tell me a joke")
+llm = OllamaLLM(model=MODEL)
+embeddings = OllamaEmbeddings(model=MODEL)
+
 parser = StrOutputParser()
-chain = llm | parser
-#chain.invoke("tell me a joke")
 
-#call the functions completed in data_prep.py here 
+if os.path.exists("split_docs.pkl"):
+    print("📂 Loading preprocessed document chunks from split_docs.pkl...")
+    with open("split_docs.pkl", "rb") as f:
+        split_docs = pickle.load(f)
+else:
+    print("🛠️ Processing raw PDFs...")
+    raw_docs = load_pdfs("data")
+    export_markdown_files(raw_docs)
+    count_characters(raw_docs)
+    split_docs = split_documents_by_structure(raw_docs)
 
-print("📥 Loading PDFs...")
-raw_docs = load_pdfs("data")  # or wherever your PDFs are
+    with open("split_docs.pkl", "wb") as f:
+        pickle.dump(split_docs, f)
+    print("✅ Saved split_docs to split_docs.pkl")
 
-print("📝 Exporting markdown...")
-export_markdown_files(raw_docs)
-
-print("🔤 Character count...")
-count_characters(raw_docs)
-
-print("✂️ Splitting documents...")
-split_docs = split_documents_by_structure(raw_docs)
-
-# ✅ Quick verification test
-print("\n✅ Split document verification:")
-print(f"Total chunks: {len(split_docs)}")
-
-# Print the first few chunks to preview their content
-for i, chunk in enumerate(split_docs[:3]):  # Show first 3 chunks
+print(f"\n✅ Total document chunks: {len(split_docs)}")
+for i, chunk in enumerate(split_docs[:3]):
     print(f"\n--- Chunk {i+1} ---")
-    print(chunk.page_content[:300])  # Show first 300 characters
+    print(chunk.page_content[:300])
     print(f"Source: {chunk.metadata.get('source')}")
 
-#question2 starts here
+# Save processed docs
+if not os.path.exists("split_docs.pkl"):
+    with open("split_docs.pkl", "wb") as f:
+        pickle.dump(split_docs, f)
+
+# Load or build FAISS vectorstore
+faiss_path = "faiss_index"
+if os.path.exists(faiss_path):
+    vectorstore = FAISS.load_local(faiss_path, embeddings, allow_dangerous_deserialization=True)
+    print("📂 Loaded FAISS vectorstore")
+else:
+    print("🔍 Building FAISS vectorstore...")
+    vectorstore = FAISS.from_documents(split_docs, embedding=embeddings)
+    vectorstore.save_local(faiss_path)
+    print("✅ FAISS vectorstore saved")
+
+# Build hybrid retriever
+bm25_retriever = BM25Retriever.from_documents(split_docs)
+bm25_retriever.k = 6
+vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
+hybrid_retriever = EnsembleRetriever(
+    retrievers=[bm25_retriever, vector_retriever],
+    weights=[0.5, 0.5]
+)
+
+# RAG prompt
 template = """
 You are an AI assistant built to answer questions strictly using the information from retrieved documents.
 
@@ -96,55 +110,25 @@ If the query cannot be answered, explain that and why.
 - Quote and cite the source if necessary.
 """
 
-# Create a prompt template from your string
 prompt = PromptTemplate.from_template(template)
 
-# Choose a small sample of split_docs to simulate a retrieval
-sample_docs = split_docs[:5]  # pretend these are retrieved docs
+# Final RAG chain
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
 
-# Combine all their content into one string (simulate `context`)
-context = "\n\n".join(doc.page_content for doc in sample_docs)
+rag_chain = RunnableMap({
+    "context": itemgetter("question") | hybrid_retriever | format_docs,
+    "query": itemgetter("question")
+}) | prompt | llm | parser
 
-# Create an input dictionary
-inputs = {
-    "context": context,
-    "query": "What is the difference between value iteration and policy iteration?"
-}
+# Interactive Q&A
+print("\n💬 Ask a question (type 'exit' to quit):")
+while True:
+    question = input("🧠 > ")
+    if question.strip().lower() in ["exit", "quit"]:
+        break
 
-# Run the chain
-print("\n🧪 Running test prompt...")
-response = chain.invoke(prompt.format(**inputs))
-print("\n📤 Final Response:\n")
-print(response)
-
-# Save the split_docs list to a file so we don't repeat all the work next time
-if not os.path.exists("split_docs.pkl"):
-    with open("split_docs.pkl", "wb") as f:
-        pickle.dump(split_docs, f)
-    print("🗃️ Saved split_docs to split_docs.pkl")
-else:
-    print("🗃️ split_docs.pkl already exists — skipping save")
-
-# ⚠️ Only build vectorstore if it doesn't already exist
-faiss_path = "faiss_index"
-if not os.path.exists(faiss_path):
-    print("🔍 Building FAISS vectorstore...")
-    vectorstore = FAISS.from_documents(split_docs, embedding=embeddings)
-    vectorstore.save_local(faiss_path)
-    print("✅ FAISS vectorstore saved to 'faiss_index'")
-else:
-    print("📂 FAISS vectorstore already exists — skipping creation")
-
-# Load it
-vectorstore = FAISS.load_local(faiss_path, embeddings)
-retriever_dense = vectorstore.as_retriever()
-
-# Create sparse retriever (BM25)
-retriever_sparse = BM25Retriever.from_documents(split_docs)
-retriever_sparse.k = 4
-
-# Combine both using EnsembleRetriever
-retriever = EnsembleRetriever(
-    retrievers=[retriever_dense, retriever_sparse],
-    weights=[0.5, 0.5]
-)
+    print("\n🤖 Answer:\n")
+    for chunk in rag_chain.stream({"question": question}):
+        print(chunk, end="", flush=True)
+    print("\n" + "-" * 60)
